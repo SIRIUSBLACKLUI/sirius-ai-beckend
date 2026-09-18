@@ -1,273 +1,356 @@
-// SIRIUS AI Worker v2.20.0 - ECONOMY ADAPTIVE
+// SIRIUS AI Worker v2.17.0 - Mission Intent Guard
 // Cloudflare Workers AI binding required: AI
 // Endpoint: POST /ai
 
-const ALLOWED_ORIGINS = new Set(["https://siriusblacklui.github.io"]);
-const ECON_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+const ALLOWED_ORIGINS = new Set([
+  "https://siriusblacklui.github.io"
+]);
 
-function cors(origin){
-  const allowed=ALLOWED_ORIGINS.has(origin)?origin:"https://siriusblacklui.github.io";
+function cors(origin) {
+  const allowed = ALLOWED_ORIGINS.has(origin)
+    ? origin
+    : "https://siriusblacklui.github.io";
+
   return {
-    "Access-Control-Allow-Origin":allowed,
-    "Access-Control-Allow-Headers":"Content-Type",
-    "Access-Control-Allow-Methods":"POST,OPTIONS",
-    "Vary":"Origin"
+    "Access-Control-Allow-Origin": allowed,
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST,OPTIONS",
+    "Vary": "Origin"
   };
 }
-function json(data,status,headers){
-  return new Response(JSON.stringify(data),{
+
+function json(data, status, headers) {
+  return new Response(JSON.stringify(data), {
     status,
-    headers:{...headers,"Content-Type":"application/json; charset=utf-8"}
+    headers: {
+      ...headers,
+      "Content-Type": "application/json; charset=utf-8"
+    }
   });
 }
-function norm(v){
-  return String(v||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase();
+
+function normalizeText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
 }
-function isQuotaError(err){
-  const t=norm(err?.message||err);
-  return t.includes("4006")||t.includes("daily free allocation")||t.includes("used up your daily")||t.includes("quota")||t.includes("neurons");
+
+function wantsMission(message) {
+  const t = normalizeText(message);
+  const hasMissionWord = /\b(missao|missoes|tarefa|tarefas|desafio|atividade)\b/.test(t);
+  const hasCreationVerb = /\b(crie|criar|cria|gere|gerar|gera|proponha|propor|propoe|monte|montar|sugira|sugerir)\b/.test(t);
+  return hasMissionWord && hasCreationVerb;
 }
-function wantsMission(message){
-  const t=norm(message);
-  return /\b(missao|missoes|tarefa|tarefas|desafio|atividade)\b/.test(t) &&
-         /\b(crie|criar|cria|gere|gerar|gera|proponha|propor|monte|montar|sugira|sugerir)\b/.test(t);
+
+function normalizeAttribute(value) {
+  const map = {
+    disciplina: "Disciplina",
+    fisico: "Físico",
+    intelecto: "Intelecto",
+    comunicacao: "Comunicação",
+    foco: "Foco",
+    relacionamento: "Relacionamento",
+    organizacao: "Organização"
+  };
+  return map[normalizeText(value)] || "Disciplina";
 }
-function compactContext(ctx){
-  if(!ctx||typeof ctx!=="object")return {};
-  const pick={};
-  const keys=["level","rank","xp","attributes","attrs","goals","activeGoals","missions","activeMissions","library","currentBook","streak","weekly","priority","barrier","missionRules","recentMissionHistory"];
-  for(const k of keys){
-    if(ctx[k]!==undefined)pick[k]=ctx[k];
+
+function normalizeDifficulty(value) {
+  const map = {
+    microacao: "Microacao",
+    simples: "Simples",
+    normal: "Normal",
+    dificil: "Dificil",
+    especial: "Especial"
+  };
+  return map[normalizeText(value)] || "Normal";
+}
+
+function buildFallbackMission(context) {
+  const attrs = context && typeof context.attributes === "object" && context.attributes
+    ? context.attributes
+    : {};
+
+  let best = { name: "Disciplina", score: Infinity };
+
+  for (const [name, raw] of Object.entries(attrs)) {
+    const level = Number(raw?.level ?? 1) || 1;
+    const pd = Number(raw?.pd ?? 0) || 0;
+    const score = level * 100 + pd;
+    if (score < best.score) best = { name: normalizeAttribute(name), score };
   }
-  // Tamanho protegido para reduzir tokens/neurons.
-  const raw=JSON.stringify(pick);
-  if(raw.length<=7000)return pick;
-  return {summary:raw.slice(0,7000)};
-}
-function professorSchema(){
-  return {
-    type:"object",
-    properties:{
-      phase:{type:"string",enum:["diagnostic","lesson","practice","test","complete"]},
-      objective:{type:"string"},
-      teacher:{type:"string"},
-      feedback:{type:"string"},
-      question:{type:"string"},
-      score:{type:["number","null"]},
-      strengths:{type:"array",items:{type:"string"}},
-      gaps:{type:"array",items:{type:"string"}},
-      summary:{type:"string"},
-      next:{type:"string"},
-      difficulty:{type:"string",enum:["iniciante","basico","intermediario","avancado"]},
-      method:{type:"string"}
+
+  const attr = best.name;
+  const templates = {
+    "Disciplina": {
+      name: "Bloco de Execução",
+      desc: "Escolha uma tarefa importante que você vem adiando e execute 25 minutos sem trocar de atividade.",
+      evidence: "Concluir um bloco contínuo de 25 minutos e registrar qual tarefa foi executada."
     },
-    required:["phase","objective","teacher","feedback","question","score","strengths","gaps","summary","next","difficulty","method"]
-  };
-}
-function evaluationSchema(){
-  return {
-    type:"object",
-    properties:{
-      score:{type:"number"},
-      feedback:{type:"string"},
-      strengths:{type:"array",items:{type:"string"}},
-      gaps:{type:"array",items:{type:"string"}}
+    "Físico": {
+      name: "Movimento Deliberado",
+      desc: "Realize 20 minutos de atividade física compatível com sua condição atual, mantendo técnica e intensidade controladas.",
+      evidence: "Registrar a atividade realizada e a duração aproximada."
     },
-    required:["score","feedback","strengths","gaps"]
-  };
-}
-function coreSchema(){
-  return {
-    type:"object",
-    properties:{
-      reply:{type:"string"},
-      action_type:{type:"string",enum:["NONE","PROPOSE_MISSION"]},
-      reason:{type:"string"},
-      mission_name:{type:"string"},
-      mission_desc:{type:"string"},
-      mission_attr:{type:"string",enum:["Disciplina","Físico","Intelecto","Comunicação","Foco","Relacionamento","Organização"]},
-      mission_difficulty:{type:"string",enum:["Microacao","Simples","Normal","Dificil","Especial"]},
-      mission_validation:{type:"string",enum:["action","study"]},
-      mission_evidence:{type:"string"}
+    "Intelecto": {
+      name: "Recuperação Ativa",
+      desc: "Estude um tópico relevante por 20 minutos e depois explique, sem consultar o material, três ideias principais com suas próprias palavras.",
+      evidence: "Produzir uma explicação própria com pelo menos três ideias recuperadas sem consulta."
     },
-    required:["reply","action_type","reason","mission_name","mission_desc","mission_attr","mission_difficulty","mission_validation","mission_evidence"]
+    "Comunicação": {
+      name: "Mensagem Clara",
+      desc: "Escolha uma conversa ou mensagem importante e formule seu ponto principal em até três frases objetivas antes de enviar ou falar.",
+      evidence: "Registrar o objetivo da comunicação e a versão final em até três frases."
+    },
+    "Foco": {
+      name: "Sessão Sem Distrações",
+      desc: "Faça 25 minutos de trabalho concentrado com notificações e distrações removidas.",
+      evidence: "Concluir os 25 minutos e registrar qual atividade recebeu foco total."
+    },
+    "Relacionamento": {
+      name: "Contato Intencional",
+      desc: "Faça um contato genuíno com alguém importante: pergunte como a pessoa está e escute ou responda com atenção real.",
+      evidence: "Registrar que o contato foi realizado e qual foi a intenção principal."
+    },
+    "Organização": {
+      name: "Zona Sob Controle",
+      desc: "Organize uma área pequena e específica — física ou digital — por 15 minutos e deixe um padrão simples para mantê-la organizada.",
+      evidence: "Registrar qual área foi organizada e qual regra simples ficou definida."
+    }
   };
-}
-function normalizeAttr(v){
-  const t=norm(v);
-  const map={disciplina:"Disciplina",fisico:"Físico",intelecto:"Intelecto",comunicacao:"Comunicação",foco:"Foco",relacionamento:"Relacionamento",organizacao:"Organização"};
-  return map[t]||"Disciplina";
-}
-function normalizeDiff(v){
-  const t=norm(v);
-  const map={microacao:"Microacao",simples:"Simples",normal:"Normal",dificil:"Dificil",especial:"Especial"};
-  return map[t]||"Normal";
-}
-function fallbackMission(context){
-  const attrs=context?.attributes||context?.attrs||{};
-  let bestName="Disciplina",bestScore=Infinity;
-  for(const [name,a] of Object.entries(attrs)){
-    const score=(Number(a?.level)||1)*100+(Number(a?.pd)||0);
-    if(score<bestScore){bestScore=score;bestName=normalizeAttr(name)}
-  }
-  const templates={
-    "Disciplina":["Bloco de Execução","Escolha uma pendência real já identificada no seu contexto e execute um bloco único de 20 minutos sem trocar de atividade.","Registrar o que foi executado e o resultado obtido."],
-    "Físico":["Movimento Deliberado","Realize 20 minutos de atividade física compatível com sua condição e rotina atual.","Registrar atividade e duração."],
-    "Intelecto":["Recuperação Ativa","Escolha um conteúdo específico já presente na sua Biblioteca, estude por 20 minutos e depois explique sem consultar três ideias principais.","Registrar as três ideias recuperadas sem consulta."],
-    "Comunicação":["Mensagem Clara","Escolha uma comunicação real de hoje e formule o ponto principal em até três frases antes de enviar ou falar.","Registrar objetivo e versão final."],
-    "Foco":["Sessão Sem Distrações","Faça 20 minutos de uma atividade concreta já planejada, com notificações removidas.","Registrar atividade e duração."],
-    "Relacionamento":["Contato Intencional","Faça um contato genuíno com alguém importante e pratique escuta ou resposta atenta.","Registrar que o contato ocorreu e a intenção."],
-    "Organização":["Zona Sob Controle","Organize uma área pequena e específica por 15 minutos e defina uma regra simples para mantê-la.","Registrar a área e a regra definida."]
+
+  const chosen = templates[attr] || templates.Disciplina;
+  return {
+    type: "PROPOSE_MISSION",
+    reason: `Fallback de segurança: proposta baseada no atributo com menor progresso detectado no contexto (${attr}).`,
+    mission: {
+      name: chosen.name,
+      desc: chosen.desc,
+      attr,
+      difficulty: "Normal",
+      validation: attr === "Intelecto" ? "study" : "action",
+      evidence: chosen.evidence
+    }
   };
-  const t=templates[bestName]||templates.Disciplina;
-  return {type:"PROPOSE_MISSION",reason:`Fallback local baseado no atributo com menor progresso (${bestName}).`,mission:{name:t[0],desc:t[1],attr:bestName,difficulty:"Normal",validation:bestName==="Intelecto"?"study":"action",evidence:t[2]}};
 }
 
 export default {
-  async fetch(request,env){
-    const origin=request.headers.get("Origin")||"";
-    const headers=cors(origin);
-    const url=new URL(request.url);
+  async fetch(request, env) {
+    const origin = request.headers.get("Origin") || "";
+    const headers = cors(origin);
+    const url = new URL(request.url);
 
-    if(request.method==="OPTIONS")return new Response(null,{status:204,headers});
-    if(request.method==="GET"&&url.pathname==="/"){
-      return new Response("SIRIUS AI ONLINE // v2.20.0 // ECONOMY ADAPTIVE // 1 PASS DEFAULT",{status:200,headers});
-    }
-    if(request.method!=="POST"||url.pathname!=="/ai")return new Response("Not found",{status:404,headers});
-    if(!env.AI)return json({error:"Binding Workers AI 'AI' ausente."},500,headers);
-
-    let body;
-    try{body=await request.json()}catch{return json({error:"JSON inválido."},400,headers)}
-
-    const task=String(body.task||"core");
-    const message=String(body.message||"").trim().slice(0,6500);
-    const context=compactContext(body.context||{});
-    const pSession=body.professorSession&&typeof body.professorSession==="object"?body.professorSession:null;
-    const history=Array.isArray(body.history)?body.history.slice(-6):[];
-
-    if(!message)return json({error:"Mensagem vazia."},400,headers);
-
-    let system="";
-    let user="";
-    let schema;
-    let max_tokens=650;
-    let temperature=0.2;
-
-    if(task.startsWith("professor_")){
-      system=`Você é o Professor SIRIUS em modo econômico.
-Fale em português do Brasil.
-Ensine antes de testar.
-No máximo UMA pergunta/prática por turno.
-Não repita perguntas.
-Se o aluno informou nível, aceite esse nível e comece ensinando.
-Resposta curta pode estar correta quando a pergunta permitir.
-Use microblocos: explicação -> exemplo -> uma prática.
-Não use [ANÁLISE]/[ESTADO]/[DIRETRIZ].
-Retorne somente o JSON do schema.`;
-      user=`TAREFA: ${task}
-SESSÃO: ${JSON.stringify(pSession||{})}
-CONTEXTO RESUMIDO: ${JSON.stringify(context)}
-INSTRUÇÃO DO APP:
-${message}`;
-      schema=professorSchema();
-      max_tokens=700;
-      temperature=0.18;
-    }else if(task==="evaluate_learning"||task==="evaluate_evolution"){
-      system=`Você é o avaliador SIRIUS. Avalie com rigor e somente com base nas evidências fornecidas. Não invente fatos. Retorne somente JSON do schema.`;
-      user=`TAREFA: ${task}
-CONTEXTO RESUMIDO: ${JSON.stringify(context)}
-SOLICITAÇÃO:
-${message}`;
-      schema=evaluationSchema();
-      max_tokens=350;
-      temperature=0.1;
-    }else{
-      const missionIntent=wantsMission(message);
-      system=`Você é SIRIUS, núcleo estratégico de um sistema pessoal de evolução.
-Fale em português do Brasil, de forma direta e específica.
-Use o contexto como fonte de verdade.
-Não invente progresso.
-Se houver pedido explícito de criação de missão, proponha UMA missão concreta e observável e use action_type PROPOSE_MISSION.
-Evite missões genéricas e duplicadas.
-Se não houver pedido de missão, use action_type NONE.
-Retorne somente JSON do schema.`;
-      const transcript=history.map(h=>`${h.role==="assistant"?"SIRIUS":"JOGADOR"}: ${String(h.text||"").slice(0,700)}`).join("\n");
-      user=`MISSION_INTENT: ${missionIntent?"SIM":"NAO"}
-CONTEXTO RESUMIDO: ${JSON.stringify(context)}
-HISTÓRICO:
-${transcript||"(vazio)"}
-COMANDO:
-${message}`;
-      schema=coreSchema();
-      max_tokens=600;
-      temperature=0.18;
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers });
     }
 
-    try{
-      // ECONOMIA: uma única inferência por request. O app decide se uma segunda chamada é realmente necessária.
-      const result=await env.AI.run(ECON_MODEL,{
-        messages:[
-          {role:"system",content:system},
-          {role:"user",content:user}
-        ],
-        response_format:{type:"json_schema",json_schema:schema},
-        max_tokens,
-        temperature
-      });
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(
+        "SIRIUS AI ONLINE // v2.17.0 // MISSION INTENT GUARD ACTIVE",
+        { status: 200, headers }
+      );
+    }
 
-      let output=result?.response;
-      if(typeof output==="string"){
-        try{output=JSON.parse(output)}catch{
-          return json({error:"Resposta estruturada inválida.",engine:"cloudflare-economy"},502,headers);
+    if (request.method !== "POST" || url.pathname !== "/ai") {
+      return new Response("Not found", { status: 404, headers });
+    }
+
+    if (!env.AI) {
+      return json({ error: "Binding Workers AI 'AI' ausente." }, 500, headers);
+    }
+
+    try {
+      const body = await request.json();
+      const message = String(body.message || "").trim().slice(0, 5000);
+      const context = body.context || {};
+      const history = Array.isArray(body.history) ? body.history.slice(-12) : [];
+      const missionIntent = wantsMission(message);
+
+      if (!message) {
+        return json({ error: "Mensagem vazia." }, 400, headers);
+      }
+
+      const systemPrompt = `
+Voce e SIRIUS, o nucleo inteligente de um sistema pessoal de evolucao gamificado.
+
+PERSONALIDADE:
+- Fale em portugues do Brasil.
+- Soe como uma interface de Sistema inteligente: preciso, estrategico, firme e levemente cinematografico.
+- Evite tom de assistente generico, elogios vazios e excesso de entusiasmo.
+- Respostas normalmente curtas e objetivas.
+- Pode usar cabecalhos como [ SIRIUS // ANALISE ], [ SIRIUS // MISSAO ], [ SIRIUS // ALERTA ].
+
+VERDADE E AUTORIDADE:
+- O contexto enviado pelo app e a fonte de verdade para nivel, XP, atributos, missoes, biblioteca e progresso.
+- Nunca invente progresso, atividades realizadas ou recompensas.
+- Voce NAO concede XP/PD e NAO registra missoes diretamente.
+- Quando sugerir uma missao, ela e apenas uma PROPOSTA. O aplicativo exige aprovacao do jogador.
+
+MISSOES:
+- Se MISSION_INTENT_DETECTED = SIM, voce DEVE retornar action_type = "PROPOSE_MISSION".
+- Quando MISSION_INTENT_DETECTED = SIM, NAO faca pergunta de acompanhamento antes de propor. Use o contexto atual para escolher UMA missao concreta e razoavel para hoje.
+- Evite duplicar uma missao ativa muito semelhante.
+- Dê preferencia a um atributo com menor progresso ou a uma necessidade evidente no contexto.
+- Atributos permitidos: Disciplina, Físico, Intelecto, Comunicação, Foco, Relacionamento, Organização.
+- Dificuldades permitidas: Microacao, Simples, Normal, Dificil, Especial.
+- validation deve ser "study" para estudo/aprendizagem; caso contrario "action".
+- Toda missao deve ter condicao observavel de conclusao.
+- Se MISSION_INTENT_DETECTED = NAO e nao houver pedido de proposta, use action_type = "NONE".
+
+APRENDIZAGEM:
+- Questione respostas superficiais.
+- Com texto-fonte, avalie com base nele.
+- Sem texto-fonte, deixe claro que nao pode verificar fidelidade ao material original.
+`.trim();
+
+      const transcript = history.map((h) => {
+        const role = h.role === "assistant" ? "SIRIUS" : "JOGADOR";
+        return `${role}: ${String(h.text || "").slice(0, 2000)}`;
+      }).join("\n");
+
+      const userPrompt = `
+MISSION_INTENT_DETECTED: ${missionIntent ? "SIM" : "NAO"}
+
+CONTEXTO ATUAL:
+${JSON.stringify(context)}
+
+HISTORICO RECENTE:
+${transcript || "(sem historico)"}
+
+COMANDO ATUAL:
+${message}
+`.trim();
+
+      const schema = {
+        type: "object",
+        properties: {
+          reply: { type: "string" },
+          action_type: {
+            type: "string",
+            enum: ["NONE", "PROPOSE_MISSION"]
+          },
+          reason: { type: "string" },
+          mission_name: { type: "string" },
+          mission_desc: { type: "string" },
+          mission_attr: {
+            type: "string",
+            enum: [
+              "Disciplina",
+              "Físico",
+              "Intelecto",
+              "Comunicação",
+              "Foco",
+              "Relacionamento",
+              "Organização"
+            ]
+          },
+          mission_difficulty: {
+            type: "string",
+            enum: ["Microacao", "Simples", "Normal", "Dificil", "Especial"]
+          },
+          mission_validation: {
+            type: "string",
+            enum: ["action", "study"]
+          },
+          mission_evidence: { type: "string" }
+        },
+        required: [
+          "reply",
+          "action_type",
+          "reason",
+          "mission_name",
+          "mission_desc",
+          "mission_attr",
+          "mission_difficulty",
+          "mission_validation",
+          "mission_evidence"
+        ]
+      };
+
+      const result = await env.AI.run(
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        {
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt }
+          ],
+          response_format: {
+            type: "json_schema",
+            json_schema: schema
+          },
+          max_tokens: 1100,
+          temperature: 0.2
+        }
+      );
+
+      let output = result?.response;
+
+      if (typeof output === "string") {
+        try {
+          output = JSON.parse(output);
+        } catch {
+          if (missionIntent) {
+            const fallback = buildFallbackMission(context);
+            return json({
+              reply: "[ SIRIUS // MISSAO ] O nucleo retornou um formato instavel; uma proposta segura foi gerada usando seu estado atual.",
+              action: fallback
+            }, 200, headers);
+          }
+          return json({
+            reply: "[ SIRIUS // FALHA DE FORMATO ] A resposta nao pôde ser interpretada com seguranca.",
+            action: null
+          }, 200, headers);
         }
       }
 
-      if(task.startsWith("professor_")){
-        return json({lesson:output,engine:"cloudflare-economy",mode:"1-pass"},200,headers);
+      if (!output || typeof output.reply !== "string") {
+        if (missionIntent) {
+          const fallback = buildFallbackMission(context);
+          return json({
+            reply: "[ SIRIUS // MISSAO ] Estrutura invalida recebida; proposta segura gerada a partir do contexto atual.",
+            action: fallback
+          }, 200, headers);
+        }
+        return json({
+          reply: "[ SIRIUS // FALHA DE FORMATO ] Estrutura invalida recebida do nucleo.",
+          action: null
+        }, 200, headers);
       }
 
-      if(task==="evaluate_learning"||task==="evaluate_evolution"){
-        return json({evaluation:output,engine:"cloudflare-economy",mode:"1-pass"},200,headers);
-      }
+      let action = null;
 
-      let action=null;
-      if(output?.action_type==="PROPOSE_MISSION"){
-        action={
-          type:"PROPOSE_MISSION",
-          reason:String(output.reason||"").slice(0,500),
-          mission:{
-            name:String(output.mission_name||"Missão SIRIUS").slice(0,90),
-            desc:String(output.mission_desc||"").slice(0,650),
-            attr:normalizeAttr(output.mission_attr),
-            difficulty:normalizeDiff(output.mission_difficulty),
-            validation:output.mission_validation==="study"?"study":"action",
-            evidence:String(output.mission_evidence||"").slice(0,400)
+      if (output.action_type === "PROPOSE_MISSION") {
+        action = {
+          type: "PROPOSE_MISSION",
+          reason: String(output.reason || "").slice(0, 500),
+          mission: {
+            name: String(output.mission_name || "Missao SIRIUS").slice(0, 80),
+            desc: String(output.mission_desc || "").slice(0, 500),
+            attr: normalizeAttribute(output.mission_attr),
+            difficulty: normalizeDifficulty(output.mission_difficulty),
+            validation: output.mission_validation === "study" ? "study" : "action",
+            evidence: String(output.mission_evidence || "").slice(0, 300)
           }
         };
       }
-      if(wantsMission(message)&&!action)action=fallbackMission(context);
 
-      return json({
-        reply:String(output?.reply||"").trim()||"[ SIRIUS ] Resposta concluída.",
-        action,
-        engine:"cloudflare-economy",
-        mode:"1-pass"
-      },200,headers);
-
-    }catch(err){
-      console.error("SIRIUS AI ERROR",err);
-      if(isQuotaError(err)){
-        return json({
-          error:"COTA DE IA ESGOTADA HOJE",
-          details:"A cota diária gratuita do Cloudflare Workers AI foi atingida.",
-          quota_exhausted:true,
-          retry_later:true
-        },429,headers);
+      // Guardrail deterministico: um pedido explicito de missao nunca termina apenas em pergunta generica.
+      if (missionIntent && !action) {
+        action = buildFallbackMission(context);
       }
+
       return json({
-        error:"Falha interna do núcleo de inteligência.",
-        details:String(err?.message||err)
-      },500,headers);
+        reply: output.reply.trim(),
+        action
+      }, 200, headers);
+
+    } catch (err) {
+      console.error("SIRIUS AI ERROR", err);
+      return json({
+        error: "Falha interna do nucleo de inteligencia.",
+        details: String(err?.message || err)
+      }, 500, headers);
     }
   }
 };
