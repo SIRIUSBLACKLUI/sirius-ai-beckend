@@ -147,9 +147,33 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(
-        "SIRIUS AI ONLINE // v2.17.0 // MISSION INTENT GUARD ACTIVE",
+        "SIRIUS AI ONLINE // v2.17.0 + TRANSLATE // MISSION INTENT GUARD ACTIVE",
         { status: 200, headers }
       );
+    }
+
+    if (request.method === "POST" && url.pathname === "/translate") {
+      if (!ALLOWED_ORIGINS.has(origin)) return json({ error: "Origem não autorizada." }, 403, headers);
+      if (!env.AI) return json({ error: "Binding Workers AI ausente." }, 503, headers);
+      try {
+        const input = await request.json();
+        const text = String(input.text || "").trim();
+        const language = ["en", "es", "fr", "de", "it"].includes(input.sourceLanguage) ? input.sourceLanguage : "en";
+        if (!text || text.length > 850) return json({ error: "Trecho inválido; limite 850 caracteres." }, 400, headers);
+        const result = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+          messages: [
+            { role: "system", content: "Traduza fielmente o texto de " + language + " para português brasileiro. Retorne somente a tradução, sem prefácio, aspas ou explicações. Preserve nomes próprios e URLs." },
+            { role: "user", content: text }
+          ],
+          max_tokens: 1100,
+          temperature: 0
+        });
+        const translation = typeof result?.response === "string" ? result.response.trim() : "";
+        if (!translation) return json({ error: "Motor de tradução não retornou texto." }, 502, headers);
+        return json({ translation }, 200, headers);
+      } catch (err) {
+        return json({ error: "Falha no motor de tradução.", details: String(err?.message || err) }, 502, headers);
+      }
     }
 
     if (request.method !== "POST" || url.pathname !== "/ai") {
